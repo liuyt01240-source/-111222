@@ -1,0 +1,875 @@
+import React, { useState, useEffect, useRef } from 'react';
+
+// --- 游戏核心逻辑与常量 ---
+
+const SUITS = ['♠', '♥', '♣', '♦'];
+const VALUES = [
+  '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2'
+];
+
+// 权重值，用于比较大小
+const VALUE_MAP = {
+  '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, '10': 10,
+  'J': 11, 'Q': 12, 'K': 13, 'A': 14, '2': 15,
+  'black_joker': 20, 'red_joker': 21
+};
+
+const TYPES = {
+  SINGLE: 'SINGLE',
+  PAIR: 'PAIR',
+  TRIPLE: 'TRIPLE',
+  TRIPLE_ONE: 'TRIPLE_ONE',
+  TRIPLE_TWO: 'TRIPLE_TWO',
+  BOMB: 'BOMB',
+  ROCKET: 'ROCKET',
+  STRAIGHT: 'STRAIGHT',
+  STRAIGHT_PAIR: 'STRAIGHT_PAIR', 
+  PLANE: 'PLANE', 
+  INVALID: 'INVALID'
+};
+
+const DIFFICULTIES = {
+  EASY: { label: '简单', color: 'bg-green-500' },
+  NORMAL: { label: '普通', color: 'bg-blue-500' },
+  HARD: { label: '困难', color: 'bg-red-500' }
+};
+
+// 生成一副牌
+const createDeck = () => {
+  let deck = [];
+  let id = 0;
+  // 普通牌
+  for (let v of VALUES) {
+    for (let s of SUITS) {
+      deck.push({
+        id: id++,
+        value: v,
+        suit: s,
+        rank: VALUE_MAP[v],
+        display: v
+      });
+    }
+  }
+  // 大小王
+  deck.push({ id: id++, value: 'black_joker', suit: '', rank: 20, display: 'Joker', isJoker: true, color: 'black' });
+  deck.push({ id: id++, value: 'red_joker', suit: '', rank: 21, display: 'Joker', isJoker: true, color: 'red' });
+  return deck;
+};
+
+// 牌型分析与比较逻辑
+const GameLogic = {
+  sortCards: (cards) => {
+    return [...cards].sort((a, b) => b.rank - a.rank); // 降序: 大 -> 小
+  },
+
+  // 分析牌型
+  analyzeHand: (cards) => {
+    if (cards.length === 0) return { type: TYPES.INVALID };
+    
+    const sorted = GameLogic.sortCards(cards);
+    const len = sorted.length;
+    const ranks = sorted.map(c => c.rank);
+    
+    // 统计每张牌的数量
+    const counts = {};
+    ranks.forEach(r => counts[r] = (counts[r] || 0) + 1);
+    const uniqueRanks = Object.keys(counts).map(Number).sort((a, b) => b - a); // 降序
+
+    // 1. 王炸
+    if (len === 2 && ranks[0] === 21 && ranks[1] === 20) return { type: TYPES.ROCKET, rank: 100 };
+
+    // 2. 炸弹
+    if (len === 4 && uniqueRanks.length === 1) return { type: TYPES.BOMB, rank: ranks[0] };
+
+    // 3. 单张
+    if (len === 1) return { type: TYPES.SINGLE, rank: ranks[0] };
+
+    // 4. 对子
+    if (len === 2 && uniqueRanks.length === 1) return { type: TYPES.PAIR, rank: ranks[0] };
+
+    // 5. 三张
+    if (len === 3 && uniqueRanks.length === 1) return { type: TYPES.TRIPLE, rank: ranks[0] };
+
+    // 6. 三带一
+    if (len === 4) {
+      const tripleRank = uniqueRanks.find(r => counts[r] === 3);
+      if (tripleRank) return { type: TYPES.TRIPLE_ONE, rank: tripleRank };
+    }
+
+    // 7. 三带二 (一对)
+    if (len === 5) {
+      const tripleRank = uniqueRanks.find(r => counts[r] === 3);
+      const pairRank = uniqueRanks.find(r => counts[r] === 2);
+      if (tripleRank && pairRank) return { type: TYPES.TRIPLE_TWO, rank: tripleRank };
+    }
+
+    // 8. 顺子 (5张及以上, 最大是A, 不能有2和王)
+    if (len >= 5 && uniqueRanks.length === len) {
+      const max = ranks[0];
+      const min = ranks[len - 1];
+      if (max < 15 && (max - min) === (len - 1)) {
+        return { type: TYPES.STRAIGHT, rank: max, len: len };
+      }
+    }
+
+    // 9. 连对 (3对及以上)
+    if (len >= 6 && len % 2 === 0 && uniqueRanks.length === len / 2) {
+       const max = uniqueRanks[0];
+       const min = uniqueRanks[uniqueRanks.length - 1];
+       if (max < 15 && (max - min) === (uniqueRanks.length - 1) && Object.values(counts).every(c => c === 2)) {
+         return { type: TYPES.STRAIGHT_PAIR, rank: max, len: len };
+       }
+    }
+
+    return { type: TYPES.INVALID };
+  },
+
+  // 判断能否管上
+  canBeat: (playedCards, targetHand) => {
+    if (!targetHand) {
+      const type = GameLogic.analyzeHand(playedCards);
+      return type.type !== TYPES.INVALID;
+    }
+
+    const currentHand = GameLogic.analyzeHand(playedCards);
+    if (currentHand.type === TYPES.INVALID) return false;
+
+    // 王炸无敌
+    if (currentHand.type === TYPES.ROCKET) return true;
+    if (targetHand.type === TYPES.ROCKET) return false;
+
+    // 炸弹管普通牌
+    if (currentHand.type === TYPES.BOMB && targetHand.type !== TYPES.BOMB) return true;
+
+    // 同类型比较
+    if (currentHand.type === targetHand.type) {
+      if (currentHand.type === TYPES.STRAIGHT || currentHand.type === TYPES.STRAIGHT_PAIR) {
+        if (currentHand.len !== targetHand.len) return false;
+      }
+      return currentHand.rank > targetHand.rank;
+    }
+
+    return false;
+  },
+
+  // --- AI 核心辅助函数 ---
+
+  // 从手牌中提取指定数量的牌 (helper)
+  getCardsByRank: (hand, rank, count) => {
+      const target = hand.filter(c => c.rank === rank);
+      return target.length >= count ? target.slice(0, count) : [];
+  },
+
+  // 查找能大过 targetRank 的相同牌型
+  findCardsByType: (hand, type, minRank, length = 0) => {
+      const counts = {};
+      hand.forEach(c => counts[c.rank] = (counts[c.rank] || 0) + 1);
+      const ranks = Object.keys(counts).map(Number).sort((a, b) => a - b); // 升序，方便找最小的
+
+      if (type === TYPES.SINGLE) {
+          const valid = ranks.find(r => r > minRank);
+          return valid ? GameLogic.getCardsByRank(hand, valid, 1) : null;
+      }
+      if (type === TYPES.PAIR) {
+          const valid = ranks.find(r => r > minRank && counts[r] >= 2);
+          return valid ? GameLogic.getCardsByRank(hand, valid, 2) : null;
+      }
+      if (type === TYPES.TRIPLE) {
+          const valid = ranks.find(r => r > minRank && counts[r] >= 3);
+          return valid ? GameLogic.getCardsByRank(hand, valid, 3) : null;
+      }
+      if (type === TYPES.BOMB) {
+          const valid = ranks.find(r => r > minRank && counts[r] === 4);
+          return valid ? GameLogic.getCardsByRank(hand, valid, 4) : null;
+      }
+      if (type === TYPES.TRIPLE_ONE) {
+          // 找一个三张
+          const tripleRank = ranks.find(r => r > minRank && counts[r] >= 3);
+          if (tripleRank) {
+              const tripleCards = GameLogic.getCardsByRank(hand, tripleRank, 3);
+              // 找一个单张 (不包含刚才的三张)
+              // 简单策略：找最小的单张，尽量保留炸弹
+              const singleRank = ranks.find(r => r !== tripleRank); 
+              if (singleRank) {
+                   const singleCard = GameLogic.getCardsByRank(hand, singleRank, 1);
+                   return [...tripleCards, ...singleCard];
+              }
+          }
+          return null;
+      }
+      if (type === TYPES.TRIPLE_TWO) {
+          const tripleRank = ranks.find(r => r > minRank && counts[r] >= 3);
+          if (tripleRank) {
+              const tripleCards = GameLogic.getCardsByRank(hand, tripleRank, 3);
+              // 找一个对子
+              const pairRank = ranks.find(r => r !== tripleRank && counts[r] >= 2);
+              if (pairRank) {
+                  const pairCards = GameLogic.getCardsByRank(hand, pairRank, 2);
+                  return [...tripleCards, ...pairCards];
+              }
+          }
+          return null;
+      }
+      if (type === TYPES.STRAIGHT) {
+          // 寻找长度为 length，且最小牌 > minRank 的顺子
+          // 过滤重复rank，只留一张用于检查连续性
+          const uniqueCards = [];
+          ranks.forEach(r => {
+             if (r < 15) uniqueCards.push(hand.find(c => c.rank === r)); // 排除2和王
+          });
+          uniqueCards.sort((a,b) => a.rank - b.rank);
+          
+          for (let i = 0; i <= uniqueCards.length - length; i++) {
+              if (uniqueCards[i].rank > minRank) {
+                  // 检查连续性
+                  let isStraight = true;
+                  for (let j = 1; j < length; j++) {
+                      if (uniqueCards[i+j].rank !== uniqueCards[i].rank + j) {
+                          isStraight = false;
+                          break;
+                      }
+                  }
+                  if (isStraight) {
+                      return uniqueCards.slice(i, i + length);
+                  }
+              }
+          }
+          return null;
+      }
+      // 简单起见，连对暂略，因为逻辑类似顺子但更复杂
+      return null;
+  },
+
+  // AI 选牌策略
+  findBestMove: (hand, targetHand, difficulty = 'NORMAL') => {
+    const sortedHand = GameLogic.sortCards(hand);
+    
+    // 错误率逻辑
+    if (difficulty === 'EASY' && targetHand && Math.random() < 0.2) return null;
+
+    // --- 主动出牌逻辑 (LEAD) ---
+    if (!targetHand) {
+        // 1. 如果一手能出完，直接出
+        const fullHandType = GameLogic.analyzeHand(sortedHand);
+        if (fullHandType.type !== TYPES.INVALID) return sortedHand;
+
+        // 2. 尝试出三带一或三带二 (优先出小的)
+        // 统计
+        const counts = {};
+        sortedHand.forEach(c => counts[c.rank] = (counts[c.rank] || 0) + 1);
+        const ranks = Object.keys(counts).map(Number).sort((a,b)=>a-b);
+        
+        // 找三张
+        const tripleRank = ranks.find(r => counts[r] === 3);
+        if (tripleRank) {
+             const tripleCards = sortedHand.filter(c => c.rank === tripleRank);
+             // 尝试带单张
+             const singleRank = ranks.find(r => r !== tripleRank && counts[r] === 1);
+             if (singleRank) {
+                 return [...tripleCards, sortedHand.find(c => c.rank === singleRank)];
+             }
+             // 尝试带对子
+             const pairRank = ranks.find(r => r !== tripleRank && counts[r] === 2);
+             if (pairRank) {
+                 return [...tripleCards, ...sortedHand.filter(c => c.rank === pairRank)];
+             }
+             // 啥都没带，直接出三张 (虽然规则通常不允许只出三张，但部分规则允许，这里作为保底)
+             // 或者如果找不到带牌，就不出三张，往下走出对子
+        }
+
+        // 3. 尝试出顺子 (简单检测：是否有5张连续)
+        // (略微复杂，作为优化点，暂优先出对子和单张)
+
+        // 4. 尝试出对子 (最小的)
+        const pairRank = ranks.find(r => counts[r] === 2);
+        if (pairRank) {
+            return sortedHand.filter(c => c.rank === pairRank);
+        }
+
+        // 5. 实在没招，出最小单张
+        // 困难模式：尽量保留2和王
+        if (difficulty === 'HARD') {
+            for (let i = sortedHand.length - 1; i >= 0; i--) {
+                if (sortedHand[i].rank < 15) return [sortedHand[i]];
+            }
+        }
+        return [sortedHand[sortedHand.length - 1]];
+    }
+
+    // --- 跟牌逻辑 (FOLLOW) ---
+    
+    // 1. 对方是王炸 -> 投降
+    if (targetHand.type === TYPES.ROCKET) return null;
+
+    // 2. 尝试同类型压制
+    let bestMove = null;
+    
+    // 优先匹配相同牌型
+    if (targetHand.type === TYPES.SINGLE) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.SINGLE, targetHand.rank);
+    else if (targetHand.type === TYPES.PAIR) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.PAIR, targetHand.rank);
+    else if (targetHand.type === TYPES.TRIPLE) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.TRIPLE, targetHand.rank);
+    else if (targetHand.type === TYPES.TRIPLE_ONE) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.TRIPLE_ONE, targetHand.rank);
+    else if (targetHand.type === TYPES.TRIPLE_TWO) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.TRIPLE_TWO, targetHand.rank);
+    else if (targetHand.type === TYPES.STRAIGHT) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.STRAIGHT, targetHand.rank, targetHand.len);
+    else if (targetHand.type === TYPES.BOMB) bestMove = GameLogic.findCardsByType(sortedHand, TYPES.BOMB, targetHand.rank);
+
+    if (bestMove) return bestMove;
+
+    // 3. 炸弹压制 (如果对方不是炸弹，或者对方是炸弹但我更大)
+    if (targetHand.type !== TYPES.BOMB && targetHand.type !== TYPES.ROCKET) {
+        return GameLogic.findCardsByType(sortedHand, TYPES.BOMB, 0); // 找任意炸弹
+    } 
+
+    // 4. 王炸压制
+    const jokers = sortedHand.filter(c => c.rank >= 20);
+    if (jokers.length === 2) return jokers;
+
+    return null; // 要不起
+  }
+};
+
+
+// --- UI 组件 ---
+
+const Card = ({ card, selected, onClick, small = false, hidden = false, isLord = false }) => {
+  if (hidden) {
+    return (
+      <div 
+        className={`
+          ${small ? 'w-10 h-14' : 'w-20 h-28 md:w-24 md:h-36'} 
+          bg-blue-600 border-2 border-white rounded-lg shadow-md flex items-center justify-center
+          bg-opacity-90 bg-pattern transform transition-all duration-200
+        `}
+      >
+        <div className="w-full h-full border border-blue-400 rounded opacity-50 m-1 flex items-center justify-center">
+            <div className="text-white opacity-20 text-2xl font-bold">CARD</div>
+        </div>
+      </div>
+    );
+  }
+
+  const isRed = card.suit === '♥' || card.suit === '♦' || card.color === 'red';
+  
+  return (
+    <div
+      onClick={() => onClick && onClick(card)}
+      className={`
+        relative flex flex-col items-center justify-between p-1
+        ${small ? 'w-10 h-14 text-sm' : 'w-20 h-28 md:w-24 md:h-36 text-xl'} 
+        bg-white rounded-lg shadow-md cursor-pointer select-none transition-all duration-200
+        ${selected ? '-translate-y-6 border-yellow-400 ring-4 ring-yellow-400 z-10' : 'hover:-translate-y-2'}
+        ${isRed ? 'text-red-600' : 'text-black'}
+      `}
+      style={{ border: '1px solid #ccc' }}
+    >
+      <div className="self-start font-bold leading-none">
+        <div>{card.display}</div>
+        <div className="text-xs scale-75 origin-top-left">{card.suit}</div>
+      </div>
+      
+      {isLord && (
+        <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-4xl opacity-20 pointer-events-none">
+            🤠
+        </div>
+      )}
+
+      <div className={`${small ? 'text-xl' : 'text-4xl'}`}>{card.suit}</div>
+      {!small && (
+         <div className="self-end font-bold leading-none rotate-180">
+            <div>{card.display}</div>
+            <div className="text-xs">{card.suit}</div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// 玩家手牌区域
+const Hand = ({ cards, isUser, onSelectCard, selectedCards = [], isLandlord }) => {
+  return (
+    <div className="flex justify-center items-end -space-x-12 md:-space-x-14 min-h-[140px] px-4">
+      {cards.map((card, idx) => (
+        <div key={card.id} style={{ zIndex: idx }} className="relative transition-all duration-300">
+             {isLandlord && idx === cards.length - 1 && isUser && (
+                <div className="absolute -top-8 left-1/2 transform -translate-x-1/2 text-2xl animate-bounce">🤠</div>
+             )}
+            <Card 
+                card={card} 
+                selected={isUser && selectedCards.includes(card.id)}
+                onClick={isUser ? onSelectCard : undefined}
+                hidden={!isUser}
+                isLord={isLandlord && !isUser} // 别人的牌背面也可以标记? 不, 正面标记
+            />
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// 记牌器组件
+const CardRecorder = ({ remainingCards }) => {
+    const ranks = ['3','4','5','6','7','8','9','10','J','Q','K','A','2', 'Joker'];
+    
+    // 计算每个点数剩余张数
+    const getCount = (label) => {
+        if (label === 'Joker') {
+            return remainingCards.filter(c => c.rank >= 20).length;
+        }
+        return remainingCards.filter(c => c.display === label).length;
+    };
+
+    return (
+        <div className="bg-black/60 text-white p-2 rounded-lg text-xs backdrop-blur-sm shadow-xl border border-white/20">
+            <div className="font-bold mb-1 text-center text-yellow-400">记牌器 (剩余)</div>
+            <div className="grid grid-cols-7 gap-x-2 gap-y-1">
+                {ranks.map(r => {
+                    const count = getCount(r);
+                    let colorClass = 'text-white';
+                    if (count === 4) colorClass = 'text-red-400 font-bold'; // 炸弹警告
+                    if (count === 0) colorClass = 'text-gray-500';
+                    return (
+                        <div key={r} className="flex justify-between w-full">
+                           <span className="opacity-70">{r === 'Joker' ? '王' : r}</span>
+                           <span className={colorClass}>{count}</span>
+                        </div>
+                    )
+                })}
+            </div>
+        </div>
+    );
+};
+
+// --- 主程序 ---
+
+export default function DouDiZhu() {
+  const [deck, setDeck] = useState([]);
+  const [players, setPlayers] = useState([[], [], []]); 
+  const [bottomCards, setBottomCards] = useState([]);
+  const [landlord, setLandlord] = useState(null);
+  const [turn, setTurn] = useState(null);
+  const [phase, setPhase] = useState('MENU'); // MENU, BIDDING, PLAYING, GAME_OVER
+  const [selectedCards, setSelectedCards] = useState([]);
+  const [lastHand, setLastHand] = useState(null); 
+  const [message, setMessage] = useState("欢迎来到斗地主!");
+  const [winner, setWinner] = useState(null);
+  const [difficulty, setDifficulty] = useState('NORMAL');
+  
+  // 记录每个玩家最后出的牌
+  const [tableCards, setTableCards] = useState({ 0: [], 1: [], 2: [] });
+  // 记录所有未知的牌（记牌器用）
+  const [remainingCards, setRemainingCards] = useState([]); 
+  const [bids, setBids] = useState({});
+
+  // --- 初始化游戏 ---
+  const initGame = () => {
+      setPhase('MENU');
+      setMessage("请选择游戏难度");
+  };
+
+  const startGame = () => {
+    const newDeck = createDeck();
+    // 洗牌
+    for (let i = newDeck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [newDeck[i], newDeck[j]] = [newDeck[j], newDeck[i]];
+    }
+    
+    // 发牌
+    const p1 = newDeck.slice(0, 17);
+    const p2 = newDeck.slice(17, 34);
+    const p3 = newDeck.slice(34, 51);
+    const bottom = newDeck.slice(51);
+
+    setDeck(newDeck);
+    setPlayers([GameLogic.sortCards(p1), GameLogic.sortCards(p2), GameLogic.sortCards(p3)]);
+    setBottomCards(bottom);
+    setLandlord(null);
+    setLastHand(null);
+    setTableCards({ 0: [], 1: [], 2: [] });
+    setWinner(null);
+    setBids({});
+    setSelectedCards([]);
+    
+    // 记牌器初始状态：除了自己的牌，其他的都算未知
+    setRemainingCards([...newDeck]);
+
+    // 剔除玩家手牌中的牌
+    const myHandIds = p1.map(c => c.id);
+    setRemainingCards(prev => prev.filter(c => !myHandIds.includes(c.id)));
+
+    // 随机决定谁先叫地主
+    const firstBidder = Math.floor(Math.random() * 3);
+    setTurn(firstBidder);
+    setPhase('BIDDING');
+    setMessage(`开始叫地主，玩家 ${firstBidder === 0 ? '你' : (firstBidder === 1 ? '右侧电脑' : '左侧电脑')} 先叫。`);
+  };
+
+  // --- 叫地主逻辑 ---
+  const handleBid = (score) => {
+      const newBids = { ...bids, [turn]: score };
+      setBids(newBids);
+
+      if (score > 0) {
+          // 成为地主
+          setLandlord(turn);
+          const newPlayers = [...players];
+          newPlayers[turn] = GameLogic.sortCards([...newPlayers[turn], ...bottomCards]);
+          setPlayers(newPlayers);
+          
+          // 如果别人是地主，底牌翻开，从记牌器移除
+          const bottomIds = bottomCards.map(c => c.id);
+          setRemainingCards(prev => prev.filter(c => !bottomIds.includes(c.id)));
+
+          setPhase('PLAYING');
+          setMessage(`${turn === 0 ? '你' : '电脑'} 抢到了地主!`);
+          setTableCards({ 0: [], 1: [], 2: [] }); 
+      } else {
+          // 不叫
+          const nextTurn = (turn + 1) % 3;
+          if (Object.keys(newBids).length === 3) {
+             // 强制地主
+             setLandlord(nextTurn); 
+             const newPlayers = [...players];
+             newPlayers[nextTurn] = GameLogic.sortCards([...newPlayers[nextTurn], ...bottomCards]);
+             setPlayers(newPlayers);
+             
+             const bottomIds = bottomCards.map(c => c.id);
+             setRemainingCards(prev => prev.filter(c => !bottomIds.includes(c.id)));
+
+             setPhase('PLAYING');
+             setMessage(`没人叫地主，${nextTurn === 0 ? '你' : '电脑'} 被迫营业。`);
+          } else {
+             setTurn(nextTurn);
+             setMessage(`玩家 ${turn} 不叫，轮到玩家 ${nextTurn}。`);
+          }
+      }
+  };
+
+  // --- AI 行为循环 ---
+  useEffect(() => {
+    if (phase !== 'BIDDING' && phase !== 'PLAYING') return;
+
+    let timer;
+    if (turn !== 0) {
+       timer = setTimeout(() => {
+           if (phase === 'BIDDING') {
+               const hand = players[turn];
+               const goodCards = hand.filter(c => c.rank >= 15).length;
+               // 难度影响叫牌激进程度
+               let threshold = 0.6;
+               if (difficulty === 'HARD') threshold = 0.4;
+               
+               const shouldBid = goodCards >= 2 || Math.random() > threshold;
+               handleBid(shouldBid ? 3 : 0);
+           } else if (phase === 'PLAYING') {
+               handleAIPlay();
+           }
+       }, 1500); // 稍微慢一点，留给动画时间
+    }
+    return () => clearTimeout(timer);
+  }, [turn, phase, players, lastHand, difficulty]);
+
+  // --- AI 出牌逻辑 ---
+  const handleAIPlay = () => {
+     const aiHand = players[turn];
+     const currentTarget = (lastHand && lastHand.playerId !== turn) ? lastHand.handAnalysis : null;
+     
+     const cardsToPlay = GameLogic.findBestMove(aiHand, currentTarget, difficulty);
+
+     if (cardsToPlay) {
+         playCards(turn, cardsToPlay);
+     } else {
+         passTurn(turn);
+     }
+  };
+
+  // --- 玩家/AI 动作 ---
+  
+  const playCards = (playerId, cards) => {
+      const currentAnalysis = GameLogic.analyzeHand(cards);
+      
+      // 更新手牌
+      const newPlayers = [...players];
+      newPlayers[playerId] = newPlayers[playerId].filter(c => !cards.find(pc => pc.id === c.id));
+      setPlayers(newPlayers);
+
+      // 记牌器更新：移除打出的牌
+      const playedIds = cards.map(c => c.id);
+      setRemainingCards(prev => prev.filter(c => !playedIds.includes(c.id)));
+
+      // 更新场上最后出的牌
+      const newHandInfo = { playerId, cards, handAnalysis: currentAnalysis };
+      setLastHand(newHandInfo);
+      
+      const newTable = { ...tableCards };
+      newTable[playerId] = cards; 
+      // 清空其他人的出牌显示，保证视觉焦点
+      for(let i=0; i<3; i++) {
+          if (i !== playerId) newTable[i] = []; 
+      }
+
+      setTableCards(newTable);
+
+      const role = playerId === landlord ? '地主' : '农民';
+      const name = playerId === 0 ? '你' : `电脑${playerId === 1 ? '(右)' : '(左)'}`;
+      setMessage(`${role} ${name} 出了 ${cards.length} 张牌`);
+
+      if (newPlayers[playerId].length === 0) {
+          setPhase('GAME_OVER');
+          const isLandlordWin = playerId === landlord;
+          setWinner(isLandlordWin ? '地主' : '农民');
+          return;
+      }
+
+      setTurn((playerId + 1) % 3);
+      if (playerId === 0) setSelectedCards([]);
+  };
+
+  const passTurn = (playerId) => {
+      const newTable = { ...tableCards };
+      newTable[playerId] = 'PASS'; 
+      setTableCards(newTable);
+      
+      const nextPlayer = (playerId + 1) % 3;
+      setTurn(nextPlayer);
+  };
+
+  const handleUserPlay = () => {
+    const cards = players[0].filter(c => selectedCards.includes(c.id));
+    const analysis = GameLogic.analyzeHand(cards);
+    if (analysis.type === TYPES.INVALID) {
+        alert("牌型不合法！");
+        return;
+    }
+    const target = (lastHand && lastHand.playerId !== 0) ? lastHand.handAnalysis : null;
+    if (target && !GameLogic.canBeat(cards, target)) {
+        alert("打不过上家！");
+        return;
+    }
+    playCards(0, cards);
+  };
+
+  const handleUserPass = () => {
+     if (!lastHand || lastHand.playerId === 0) {
+         alert("你是先手，必须出牌！");
+         return;
+     }
+     passTurn(0);
+     setSelectedCards([]);
+  };
+
+  const handleUserSelect = (card) => {
+    if (phase !== 'PLAYING' || turn !== 0) return;
+    setSelectedCards(prev => prev.includes(card.id) ? prev.filter(id => id !== card.id) : [...prev, card.id]);
+  };
+
+  // --- 渲染辅助 ---
+  const renderTableCards = (playerId) => {
+    const content = tableCards[playerId];
+    if (!content || content.length === 0) return null;
+    
+    if (content === 'PASS') {
+        return <div className="text-white/80 font-bold text-2xl bg-black/40 px-6 py-2 rounded-full animate-pulse backdrop-blur-sm">不要</div>;
+    }
+    
+    const animationClass = "animate-zoom-in";
+    const spacing = content.length > 5 ? '-space-x-8' : '-space-x-6';
+
+    return (
+        <div className={`flex ${spacing} origin-center transition-all duration-300 ${animationClass}`}>
+            {content.map((c, i) => (
+                <div key={i} style={{zIndex: i}} className="transform hover:-translate-y-2 transition-transform">
+                    <Card card={c} small={false} /> 
+                </div>
+            ))}
+        </div>
+    );
+  };
+
+  // 菜单界面
+  if (phase === 'MENU') {
+      return (
+        <div className="flex flex-col h-screen w-full bg-green-800 text-white items-center justify-center space-y-8 bg-pattern">
+            <h1 className="text-6xl font-bold text-yellow-400 drop-shadow-lg mb-8">斗地主</h1>
+            <div className="flex gap-6">
+                {Object.keys(DIFFICULTIES).map(key => (
+                    <button 
+                        key={key}
+                        onClick={() => { setDifficulty(key); startGame(); }}
+                        className={`${DIFFICULTIES[key].color} hover:brightness-110 text-white text-2xl font-bold py-4 px-10 rounded-2xl shadow-xl transition-transform hover:scale-105 active:scale-95`}
+                    >
+                        {DIFFICULTIES[key].label}模式
+                    </button>
+                ))}
+            </div>
+            <div className="text-white/60 mt-8">选择难度开始游戏</div>
+        </div>
+      );
+  }
+
+  return (
+    <div className="flex flex-col h-screen w-full bg-[#1a5c37] text-white overflow-hidden select-none font-sans relative">
+      <style>{`
+        .bg-pattern {
+            background-image: radial-gradient(#2d8a55 15%, transparent 16%), radial-gradient(#2d8a55 15%, transparent 16%);
+            background-size: 20px 20px;
+            background-position: 0 0, 10px 10px;
+        }
+        @keyframes zoom-in {
+            0% { transform: scale(0.5); opacity: 0; }
+            80% { transform: scale(1.1); opacity: 1; }
+            100% { transform: scale(1.0); opacity: 1; }
+        }
+        .animate-zoom-in {
+            animation: zoom-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+        }
+      `}</style>
+
+      {/* 顶部栏 */}
+      <div className="flex justify-between items-center p-4 bg-black/20 shadow-lg h-16 z-20 backdrop-blur-sm">
+        <div className="flex items-center gap-4">
+             <button onClick={initGame} className="bg-white/20 hover:bg-white/30 px-3 py-1 rounded text-sm">返回</button>
+             <div className="font-bold text-lg text-yellow-400">难度: {DIFFICULTIES[difficulty].label}</div>
+             <div className="text-sm opacity-90 hidden md:block">{message}</div>
+        </div>
+        
+        {/* 底牌展示 */}
+        <div className="flex gap-2">
+            {bottomCards.length > 0 ? bottomCards.map(c => (
+                <div key={c.id} className="transform scale-75 origin-top">
+                    <Card card={c} small hidden={phase === 'BIDDING'} />
+                </div>
+            )) : <div className="text-xs border border-white/30 p-2 rounded">底牌区</div>}
+        </div>
+      </div>
+
+      {/* 游戏主区域 */}
+      <div className="flex-1 relative flex flex-col w-full max-w-7xl mx-auto">
+        
+        {/* 左侧电脑 (Player 2) */}
+        <div className="absolute left-2 top-20 flex flex-col items-center gap-2 z-10">
+             <div className={`flex flex-col items-center p-2 rounded-lg ${turn === 2 ? 'bg-yellow-500/20 ring-2 ring-yellow-400' : ''}`}>
+                <div className={`w-16 h-16 rounded-full flex items-center justify-center text-3xl border-4 shadow-lg bg-gray-200 ${landlord === 2 ? 'border-yellow-500' : 'border-gray-500'}`}>
+                    {landlord === 2 ? '🤠' : '👨‍🌾'}
+                </div>
+                <div className="text-xs mt-1 font-bold bg-black/40 px-2 rounded-full">{players[2].length}张</div>
+             </div>
+        </div>
+
+        {/* 右侧电脑 (Player 1) */}
+        <div className="absolute right-2 top-20 flex flex-col items-center gap-2 z-10">
+             <div className={`flex flex-col items-center p-2 rounded-lg ${turn === 1 ? 'bg-yellow-500/20 ring-2 ring-yellow-400' : ''}`}>
+                <div className={`w-16 h-16 rounded-full flex items-center justify-center text-3xl border-4 shadow-lg bg-gray-200 ${landlord === 1 ? 'border-yellow-500' : 'border-gray-500'}`}>
+                    {landlord === 1 ? '🤠' : '👨‍🌾'}
+                </div>
+                <div className="text-xs mt-1 font-bold bg-black/40 px-2 rounded-full">{players[1].length}张</div>
+             </div>
+        </div>
+
+        {/* 记牌器 (右上角，但在头像下方) */}
+        <div className="absolute right-2 top-48 z-10 hidden md:block">
+            <CardRecorder remainingCards={remainingCards} />
+        </div>
+        {/* 移动端记牌器位置 */}
+        <div className="absolute top-16 left-1/2 transform -translate-x-1/2 z-0 opacity-80 md:hidden scale-75 origin-top">
+             <CardRecorder remainingCards={remainingCards} />
+        </div>
+
+
+        {/* --- 核心出牌展示区 (屏幕中间) --- */}
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0">
+             <div className="absolute left-[15%] top-[35%] md:left-[20%]">
+                 {renderTableCards(2)}
+             </div>
+
+             <div className="absolute right-[15%] top-[35%] md:right-[20%]">
+                 {renderTableCards(1)}
+             </div>
+
+             <div className="absolute bottom-[40%] left-1/2 transform -translate-x-1/2">
+                 {renderTableCards(0)}
+             </div>
+        </div>
+
+        {/* 胜利结算 */}
+        {winner && (
+             <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in">
+                <div className="bg-white text-black p-8 rounded-2xl shadow-2xl text-center transform scale-110">
+                    <div className="text-6xl mb-4">{winner === '地主' ? '🤠' : '👨‍🌾'}</div>
+                    <h1 className={`text-5xl font-bold mb-4 ${winner === '地主' ? 'text-yellow-600' : 'text-green-600'}`}>{winner} 获胜!</h1>
+                    <div className="flex justify-center gap-4 mt-6">
+                        <button onClick={startGame} className="bg-blue-600 hover:bg-blue-700 text-white text-xl font-bold px-8 py-3 rounded-full shadow-lg transition-transform hover:scale-105">
+                            再来一局
+                        </button>
+                        <button onClick={initGame} className="bg-gray-200 hover:bg-gray-300 text-gray-800 text-xl font-bold px-8 py-3 rounded-full shadow-lg">
+                            返回主页
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {/* 底部玩家控制区 */}
+        <div className="mt-auto mb-2 flex flex-col items-center gap-2 w-full z-30">
+            
+            {/* 提示信息 */}
+            <div className="h-8 text-yellow-300 font-bold text-shadow">{turn === 0 ? "轮到你了!" : ""}</div>
+
+            {/* 控制按钮组 */}
+            <div className="h-12 flex gap-4 items-center">
+                {phase === 'BIDDING' && turn === 0 && (
+                    <>
+                        <button onClick={() => handleBid(3)} className="bg-yellow-500 hover:bg-yellow-600 text-white px-8 py-2 rounded-full font-bold shadow-lg transform transition active:scale-95 border-b-4 border-yellow-700">
+                            叫地主
+                        </button>
+                        <button onClick={() => handleBid(0)} className="bg-gray-500 hover:bg-gray-600 text-white px-8 py-2 rounded-full font-bold shadow-lg transform transition active:scale-95 border-b-4 border-gray-700">
+                            不叫
+                        </button>
+                    </>
+                )}
+
+                {phase === 'PLAYING' && turn === 0 && (
+                    <>
+                        {(!lastHand || lastHand.playerId !== 0) && (
+                            <button onClick={handleUserPass} className="bg-orange-500 hover:bg-orange-600 text-white px-6 py-2 rounded-full font-bold shadow-lg border-b-4 border-orange-700 active:scale-95">
+                                不出
+                            </button>
+                        )}
+                        <button 
+                            onClick={handleUserPlay} 
+                            disabled={selectedCards.length === 0}
+                            className={`px-10 py-2 rounded-full font-bold shadow-lg border-b-4 active:scale-95 transition-all
+                                ${selectedCards.length > 0 
+                                    ? 'bg-blue-500 hover:bg-blue-600 text-white border-blue-700' 
+                                    : 'bg-gray-400 text-gray-200 border-gray-500 cursor-not-allowed'}`}
+                        >
+                            出牌
+                        </button>
+                        <button onClick={() => setSelectedCards([])} className="bg-white/20 hover:bg-white/30 text-white px-4 py-2 rounded-full text-sm backdrop-blur-md">
+                            重选
+                        </button>
+                    </>
+                )}
+            </div>
+
+            {/* 玩家手牌 */}
+            <div className="w-full px-2 overflow-visible pb-2 pt-4">
+                <div className="flex items-center gap-2 mb-[-10px] ml-4">
+                     <div className={`w-10 h-10 rounded-full flex items-center justify-center text-xl border-2 bg-gray-100 ${landlord === 0 ? 'border-yellow-500' : 'border-gray-500'}`}>
+                        {landlord === 0 ? '🤠' : '👨‍🌾'}
+                    </div>
+                    <span className="text-xs bg-black/50 px-2 py-1 rounded text-white">你</span>
+                </div>
+                <Hand 
+                    cards={players[0]} 
+                    isUser={true} 
+                    onSelectCard={handleUserSelect} 
+                    selectedCards={selectedCards}
+                    isLandlord={landlord === 0}
+                />
+            </div>
+        </div>
+      </div>
+    </div>
+  );
+}
